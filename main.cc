@@ -11,6 +11,12 @@ extern "C" {
 
 typedef long Index_t;
 typedef long Scalar_t;
+typedef std::vector<std::tuple<Index_t, Scalar_t>> Row_t;
+typedef Row_t * pRow_t;
+typedef pRow_t * ppRow_t;
+
+static inline Index_t n_map(Index_t i) { return i % NODELETS(); }
+static inline Index_t r_map(Index_t i) { return i / NODELETS(); }
 
 /*
  * Overrides default new to always allocate replicated storage for instances
@@ -35,10 +41,6 @@ public:
         mw_free(ptr);
     }
 };
-
-typedef std::vector<std::tuple<Index_t, Scalar_t>> Row_t;
-typedef Row_t * pRow_t;
-typedef pRow_t * ppRow_t;
 
 class Matrix_t : public repl_new
 {
@@ -98,10 +100,10 @@ public:
 private:
     Matrix_t(Index_t nrows) : nrows_(nrows)
     {
-        nrows_per_nodelet_ = nrows_ + nrows_ % NODELETS();
-
+        nrows_per_nodelet_ = r_map(nrows_) + n_map(nrows_); 
         rows_ = (ppRow_t)mw_malloc2d(NODELETS(),
                                      nrows_per_nodelet_ * sizeof(Row_t));
+	// printf("\n %ld, %ld ", nrows_per_nodelet_, nrows_);
 
         // replicate the class across nodelets
         for (Index_t i = 1; i < NODELETS(); ++i)
@@ -121,9 +123,12 @@ private:
     // localalloc a single row
     void allocateRow(Index_t i)
     {
-        for (Index_t j = 0; j < nrows_per_nodelet_; ++j)
+        for (Index_t row_idx= 0; row_idx < nrows_; ++row_idx)
         {
-            new(rows_[i] + j) Row_t();
+ 		size_t nid(n_map(row_idx));
+        	size_t rid(r_map(row_idx));
+		// printf("\n %zd, %zd ", nid, rid);
+		new(rows_[nid] + rid) Row_t();
         }
     }
 
@@ -144,9 +149,9 @@ int main(int argc, char* argv[])
 
     Index_t nrows = 16;
 
-    // Matrix A will have 16 rows on each nodelet,total 16X8 rows
+    // Matrix A will have 2 rows on each nodelet,total 2X8 rows
     Matrix_t * A = Matrix_t::create(nrows);
-    // Matrix B will have 16 rows on each nodelet,total 16X8 rows
+    // Matrix B will have 2 rows on each nodelet,total 2X8 rows
     Matrix_t * B = Matrix_t::create(nrows);
 
     Index_t nlet_idx_1 = 2;  // Build at 2nd nodelet [Nodelets start at 0 and end at 7]
@@ -162,10 +167,10 @@ int main(int argc, char* argv[])
 #ifdef timeit
     unsigned long endtime = CLOCK();
     unsigned long nidend = NODE_ID();
-    if (nid != nidend) printf("timing problem %lu %lu\n", nid, nidend);
+    if (nid != nidend) printf("\n Timing problem %lu %lu \n", nid, nidend);
     unsigned long totaltime = endtime - starttime;
     double ms = ((double) totaltime / clockrate) / 1000.0;
-    printf("Clock %.1lf Mhz\t Total Cycles %lu\t Time(ms) %.1lf\n",
+    printf("ClockRate %.1lf Mhz\t Total Cycles %lu\t Time(ms) %.1lf\n",
          clockrate, totaltime, ms); fflush(stdout);
 #endif
     
