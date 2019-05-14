@@ -7,10 +7,17 @@
 #include <distributed.h>
 extern "C" {
 #include <emu_c_utils/layout.h>
+#include <emu_c_utils/hooks.h>
 }
 
 typedef long Index_t;
 typedef long Scalar_t;
+typedef std::vector<std::tuple<Index_t, Scalar_t>> Row_t;
+typedef Row_t * pRow_t;
+typedef pRow_t * ppRow_t;
+
+static inline Index_t n_map(Index_t i) { return i % NODELETS(); }
+static inline Index_t r_map(Index_t i) { return i / NODELETS(); }
 
 /*
  * Overrides default new to always allocate replicated storage for instances
@@ -36,10 +43,6 @@ public:
     }
 };
 
-typedef std::vector<std::tuple<Index_t, Scalar_t>> Row_t;
-typedef Row_t * pRow_t;
-typedef pRow_t * ppRow_t;
-
 class Matrix_t : public repl_new
 {
 public:
@@ -53,7 +56,7 @@ public:
     Matrix_t & operator=(const Matrix_t &) = delete;
     Matrix_t(Matrix_t &&) = delete;
     Matrix_t & operator=(Matrix_t &&) = delete;
-  
+    
     // fake build function to watch migrations when adding rows
     // using replicated classes
     void build(Index_t row_idx)
@@ -82,24 +85,24 @@ public:
         }
         
         // bc of replication this does not cause migration
-        pRow_t rowPtr = rows_[row_idx];
+        pRow_t rowPtr = rows_[n_map(row_idx)] + r_map(row_idx);
         
         for (Row_t::iterator it = tmpRow.begin(); it < tmpRow.end(); ++it)
         {
             rowPtr->push_back(*it);
         }
     }
+
     Index_t * nodelet_addr(Index_t i)
     {
-        // dereferencing causes migrations
-        return (Index_t *)(rows_ + i);
+      // dereferencing causes migrations
+      return (Index_t *)(rows_ + n_map(i));
     }
-  
+    
 private:
     Matrix_t(Index_t nrows) : nrows_(nrows)
     {
-        nrows_per_nodelet_ = nrows_ + nrows_ % NODELETS();
-
+        nrows_per_nodelet_ = r_map(nrows_) + n_map(nrows_); 
         rows_ = (ppRow_t)mw_malloc2d(NODELETS(),
                                      nrows_per_nodelet_ * sizeof(Row_t));
 
@@ -113,17 +116,17 @@ private:
         for (Index_t i = 0; i < NODELETS(); ++i)
         {
             cilk_migrate_hint(rows_ + i);
-            cilk_spawn allocateRow(i);
+            cilk_spawn allocateRows(i);
         }
         cilk_sync;
     }
 
     // localalloc a single row
-    void allocateRow(Index_t i)
+    void allocateRows(Index_t i)
     {
-        for (Index_t j = 0; j < nrows_per_nodelet_; ++j)
+        for (Index_t row_idx= 0; row_idx < nrows_per_nodelet_; ++row_idx)
         {
-            new(rows_[i] + j) Row_t();
+            new(rows_[i] + row_idx) Row_t();
         }
     }
 
@@ -134,47 +137,83 @@ private:
 
 int main(int argc, char* argv[])
 {
-    starttiming();
-
-#ifdef timeit
-    double clockrate = 175.0;
-    unsigned long nid = NODE_ID();
-    unsigned long starttime = CLOCK();
-#endif
-
     Index_t nrows = 16;
+    hooks_region_begin("GBTL_Matrix_Build");
 
-    // Matrix A will have 16 rows on each nodelet,total 16X8 rows
+    // Nodelets start at 0 and end at 7
+    // Matrix A will have 2 rows on per nodelet,total 2RowsX8Nodelets
+    /*
+    Expected Migration:
+    	Thread 0 migrates to each nodelet, spawns 1 thread and returns back to nodelet 0
+    	Spawned thread does the allocation for all rows in its current spawned nodelet
+    	and return to nodelet 0
+
+    Cause: 
+    	derefrencing rows_[nid] + rid and rows_ + nid cause a migration
+
+    Resulting Memory Map:
+    	MEMORY MAP at this stage
+    	6675,1,1,1,1,1,1,1
+    	2,10,0,0,0,0,0,0
+    	2,0,10,0,0,0,0,0
+    	2,0,0,10,0,0,0,0
+    	2,0,0,0,10,0,0,0
+    	2,0,0,0,0,10,0,0
+   	2,0,0,0,0,0,10,0
+    	2,0,0,0,0,0,0,10
+    */
     Matrix_t * A = Matrix_t::create(nrows);
-    // Matrix B will have 16 rows on each nodelet,total 16X8 rows
+
+    // Matrix B will have 2 rows on per nodelet,total 2RowsX8Nodelets
+    // Same : No change from above
     Matrix_t * B = Matrix_t::create(nrows);
 
-    Index_t nlet_idx_1 = 2;  // Build at 2nd nodelet [Nodelets start at 0 and end at 7]
-    cilk_migrate_hint(A->nodelet_addr(nlet_idx_1));
-    cilk_spawn A->build(nlet_idx_1);
+    Index_t row_idx_1 = 2; // Build at 1st row in 2nd nodelet
+    /*
+    Expected Migration:
+	The last spawned thread from allocRows migrates to nodelet 2 
+        and spawns a build function at nodelet 2
+    Cause: 
+	because of the cilk_migrate_hint at nodelet 2
+    Resulting Memory Map:
+	MEMORY MAP without B matrix
+	6712,1,2,1,1,1,1,1
+	2,10,0,0,0,0,0,0
+	4,0,1371,0,0,0,0,0
+	2,0,0,10,0,0,0,0
+	2,0,0,0,10,0,0,0
+	2,0,0,0,0,10,0,0
+	2,0,0,0,0,0,10,0
+	2,0,0,0,0,0,0,10
+    */
+    cilk_migrate_hint(A->nodelet_addr(row_idx_1));
+    cilk_spawn A->build(row_idx_1);
     
-    Index_t nlet_idx_2 = 6;  // Build at 6th nodelet
-    cilk_migrate_hint(B->nodelet_addr(nlet_idx_2));
-    cilk_spawn B->build(nlet_idx_2);
-    
-    cilk_sync;
+    Index_t row_idx_2 = 13; // Build at 2nd row in 5th nodelet
+    /*
+    Expected Migration:
+	The last spawned thread from allocRows migrates to nodelet 5 
+        and spawns a build function at nodelet 5
+    Cause:
+	because of the cilk_migrate_hint at nodelet 5
+    Resulting Memory Map:
+	MEMORY MAP full program
+	7323,2,3,2,2,3,2,2
+	4,20,0,0,0,0,0,0
+	6,0,1381,0,0,0,0,0
+	4,0,0,20,0,0,0,0
+	4,0,0,0,20,0,0,0
+	6,0,0,0,0,1338,0,0
+	4,0,0,0,0,0,20,0
+	4,0,0,0,0,0,0,20
+   */
+    cilk_migrate_hint(B->nodelet_addr(row_idx_2));
+    cilk_spawn B->build(row_idx_2);
 
-#ifdef timeit
-    unsigned long endtime = CLOCK();
-    unsigned long nidend = NODE_ID();
-    if (nid != nidend) printf("timing problem %lu %lu\n", nid, nidend);
-    unsigned long totaltime = endtime - starttime;
-    double ms = ((double) totaltime / clockrate) / 1000.0;
-    printf("Clock %.1lf Mhz\t Total Cycles %lu\t Time(ms) %.1lf\n",
-         clockrate, totaltime, ms); fflush(stdout);
-#endif
+    cilk_sync;
     
+    hooks_region_end();
+
     return 0;
 }
-
-
-
-
-
-
 
