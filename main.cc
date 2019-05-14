@@ -4,6 +4,7 @@
 
 #include <cilk.h>
 #include <memoryweb.h>
+#include <distributed.h>
 extern "C" {
 #include <emu_c_utils/layout.h>
 }
@@ -52,7 +53,7 @@ public:
     Matrix_t & operator=(const Matrix_t &) = delete;
     Matrix_t(Matrix_t &&) = delete;
     Matrix_t & operator=(Matrix_t &&) = delete;
-    
+  
     // fake build function to watch migrations when adding rows
     // using replicated classes
     void build(Index_t row_idx)
@@ -88,19 +89,19 @@ public:
             rowPtr->push_back(*it);
         }
     }
-
     Index_t * nodelet_addr(Index_t i)
     {
         // dereferencing causes migrations
         return (Index_t *)(rows_ + i);
     }
-    
+  
 private:
     Matrix_t(Index_t nrows) : nrows_(nrows)
     {
         nrows_per_nodelet_ = nrows_ + nrows_ % NODELETS();
 
-        rows_ = (ppRow_t)mw_malloc1dlong(nrows_);
+        rows_ = (ppRow_t)mw_malloc2d(NODELETS(),
+                                     nrows_per_nodelet_ * sizeof(Row_t));
 
         // replicate the class across nodelets
         for (Index_t i = 1; i < NODELETS(); ++i)
@@ -109,7 +110,7 @@ private:
         }
 
         // local mallocs on each nodelet
-        for (Index_t i = 0; i < nrows_; ++i)
+        for (Index_t i = 0; i < NODELETS(); ++i)
         {
             cilk_migrate_hint(rows_ + i);
             cilk_spawn allocateRow(i);
@@ -120,7 +121,10 @@ private:
     // localalloc a single row
     void allocateRow(Index_t i)
     {
-        rows_[i] = new Row_t(); // allocRow must be spawned on correct nlet
+        for (Index_t j = 0; j < nrows_per_nodelet_; ++j)
+        {
+            new(rows_[i] + j) Row_t();
+        }
     }
 
     Index_t nrows_;
@@ -132,54 +136,45 @@ int main(int argc, char* argv[])
 {
     starttiming();
 
+#ifdef timeit
+    double clockrate = 175.0;
+    unsigned long nid = NODE_ID();
+    unsigned long starttime = CLOCK();
+#endif
+
     Index_t nrows = 16;
 
-    // 2 migrations from:     0 => 1...7  (round robin)
-    // 4 migrations from: 1...7 => 0
-    // - 2 from main thread returning from each nodelet
-    // - 2 from each spawned thread returning from each nodelet
+    // Matrix A will have 16 rows on each nodelet,total 16X8 rows
     Matrix_t * A = Matrix_t::create(nrows);
-
-    // double migrations from above
-    // 4 migrations from:     0 => 1...7
-    // 8 migrations from: 1...7 => 0
+    // Matrix B will have 16 rows on each nodelet,total 16X8 rows
     Matrix_t * B = Matrix_t::create(nrows);
 
-    Index_t row_idx_1 = 2; // row on nodelet 2
-    cilk_migrate_hint(A->nodelet_addr(row_idx_1));
-    // adds one migration  0 => 2
-    // adds two migrations 2 => 0, main thread and spawned thread
-    cilk_spawn A->build(row_idx_1);
-    /*
-      MEMORY MAP
-      2359,4,5,4,4,4,4,4
-      8,234,0,0,0,0,0,0
-      10,0,1556,0,0,0,0,0
-      8,0,0,234,0,0,0,0
-      8,0,0,0,234,0,0,0
-      8,0,0,0,0,234,0,0
-      8,0,0,0,0,0,234,0
-      8,0,0,0,0,0,0,234
-    */
-
-    Index_t row_idx_2 = 13; // row on nodelet 5
-    cilk_migrate_hint(B->nodelet_addr(row_idx_2));
-    // adds one migration 2 => 5    // NEEDS EXPLANATION
-    // adds one migration 5 => 2    // NEEDS EXPLANATION
-    // adds one migration 5 => 0
-    cilk_spawn B->build(row_idx_2);
-    /*
-      2332,4,5,4,4,4,4,4
-      8,234,0,0,0,0,0,0
-      10,0,1607,0,0,1,0,0
-      8,0,0,234,0,0,0,0
-      8,0,0,0,234,0,0,0
-      9,0,1,0,0,1513,0,0
-      8,0,0,0,0,0,234,0
-      8,0,0,0,0,0,0,234
-    */
-
+    Index_t nlet_idx_1 = 2;  // Build at 2nd nodelet [Nodelets start at 0 and end at 7]
+    cilk_migrate_hint(A->nodelet_addr(nlet_idx_1));
+    cilk_spawn A->build(nlet_idx_1);
+    
+    Index_t nlet_idx_2 = 6;  // Build at 6th nodelet
+    cilk_migrate_hint(B->nodelet_addr(nlet_idx_2));
+    cilk_spawn B->build(nlet_idx_2);
+    
     cilk_sync;
+
+#ifdef timeit
+    unsigned long endtime = CLOCK();
+    unsigned long nidend = NODE_ID();
+    if (nid != nidend) printf("timing problem %lu %lu\n", nid, nidend);
+    unsigned long totaltime = endtime - starttime;
+    double ms = ((double) totaltime / clockrate) / 1000.0;
+    printf("Clock %.1lf Mhz\t Total Cycles %lu\t Time(ms) %.1lf\n",
+         clockrate, totaltime, ms); fflush(stdout);
+#endif
     
     return 0;
 }
+
+
+
+
+
+
+
