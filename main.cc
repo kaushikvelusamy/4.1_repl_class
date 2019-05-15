@@ -7,6 +7,7 @@
 #include <distributed.h>
 extern "C" {
 #include <emu_c_utils/layout.h>
+#include <emu_c_utils/hooks.h>
 }
 
 typedef long Index_t;
@@ -55,7 +56,7 @@ public:
     Matrix_t & operator=(const Matrix_t &) = delete;
     Matrix_t(Matrix_t &&) = delete;
     Matrix_t & operator=(Matrix_t &&) = delete;
-  
+    
     // fake build function to watch migrations when adding rows
     // using replicated classes
     void build(Index_t row_idx)
@@ -91,19 +92,19 @@ public:
             rowPtr->push_back(*it);
         }
     }
+
     Index_t * nodelet_addr(Index_t i)
     {
         // dereferencing causes migrations
         return (Index_t *)(rows_ + i);
     }
-  
+    
 private:
     Matrix_t(Index_t nrows) : nrows_(nrows)
     {
         nrows_per_nodelet_ = r_map(nrows_) + n_map(nrows_); 
         rows_ = (ppRow_t)mw_malloc2d(NODELETS(),
                                      nrows_per_nodelet_ * sizeof(Row_t));
-	// printf("\n %ld, %ld ", nrows_per_nodelet_, nrows_);
 
         // replicate the class across nodelets
         for (Index_t i = 1; i < NODELETS(); ++i)
@@ -123,12 +124,11 @@ private:
     // localalloc a single row
     void allocateRow(Index_t i)
     {
-        for (Index_t row_idx= 0; row_idx < nrows_; ++row_idx)
+        for (Index_t row_idx= 0; row_idx < nrows_per_nodelet_; ++row_idx)
         {
- 		size_t nid(n_map(row_idx));
-        	size_t rid(r_map(row_idx));
-		// printf("\n %zd, %zd ", nid, rid);
-		new(rows_[nid] + rid) Row_t();
+	    Index_t nid(n_map(row_idx));
+	    Index_t rid(r_map(row_idx));
+	    new(rows_[nid] + rid) Row_t();
         }
     }
 
@@ -139,16 +139,9 @@ private:
 
 int main(int argc, char* argv[])
 {
-    starttiming();
-
-#ifdef timeit
-    double clockrate = 175.0;
-    unsigned long nid = NODE_ID();
-    unsigned long starttime = CLOCK();
-#endif
-
     Index_t nrows = 16;
-
+    hooks_region_begin("GBTL_Matrix_Build");
+    
     // Matrix A will have 2 rows on each nodelet,total 2X8 rows
     Matrix_t * A = Matrix_t::create(nrows);
     // Matrix B will have 2 rows on each nodelet,total 2X8 rows
@@ -163,23 +156,9 @@ int main(int argc, char* argv[])
     cilk_spawn B->build(nlet_idx_2);
     
     cilk_sync;
-
-#ifdef timeit
-    unsigned long endtime = CLOCK();
-    unsigned long nidend = NODE_ID();
-    if (nid != nidend) printf("\n Timing problem %lu %lu \n", nid, nidend);
-    unsigned long totaltime = endtime - starttime;
-    double ms = ((double) totaltime / clockrate) / 1000.0;
-    printf("ClockRate %.1lf Mhz\t Total Cycles %lu\t Time(ms) %.1lf\n",
-         clockrate, totaltime, ms); fflush(stdout);
-#endif
     
+    hooks_region_end();
+
     return 0;
 }
-
-
-
-
-
-
 
