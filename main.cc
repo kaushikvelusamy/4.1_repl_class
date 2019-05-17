@@ -140,78 +140,108 @@ int main(int argc, char* argv[])
     Index_t nrows = 16;
     hooks_region_begin("GBTL_Matrix_Build");
 
-    // Nodelets start at 0 and end at 7
-    // Matrix A will have 2 rows on per nodelet,total 2RowsX8Nodelets
     /*
+    Nodelets start at 0 and end at 7
+    Matrix A will have 2 rows per nodelet, total 2RowsX8Nodelets
+    
     Expected Migration:
-    	Thread 0 migrates to each nodelet, spawns 1 thread and returns back to nodelet 0
+    	Thread 0 migrates to each nodelet, spawns 1 thread and returns back to nodelet 0.
     	Spawned thread does the allocation for all rows in its current spawned nodelet
-    	and return to nodelet 0
+    	and return to nodelet 0.
+        So in total there is one migration on each 0..1, 0..2, ..... 0..7 and another for 
+        each 1..0, 2..0, ....., 7..0 the spawned threads on each nodelet migrate back to 0.
+        ie. 1..0, ..... ,7..0 
 
     Cause: 
-    	derefrencing rows_[nid] + rid and rows_ + nid cause a migration
-
-    Resulting Memory Map:
-    	MEMORY MAP at this stage
-    	6675,1,1,1,1,1,1,1
-    	2,10,0,0,0,0,0,0
-    	2,0,10,0,0,0,0,0
-    	2,0,0,10,0,0,0,0
-    	2,0,0,0,10,0,0,0
-    	2,0,0,0,0,10,0,0
-   	2,0,0,0,0,0,10,0
-    	2,0,0,0,0,0,0,10
+    	cilk_migrate_hint(rows_ + i) informs the runtime that the next thread should be
+        spawned on the nodelet that contains address "rows_ + i".
+        So the main thread migrates to that nodelet and then spawns a thread.
     */
+
     Matrix_t * A = Matrix_t::create(nrows);
 
-    // Matrix B will have 2 rows on per nodelet,total 2RowsX8Nodelets
-    // Same : No change from above
+    /*
+    Resulting Memory Map at this stage
+    6675,1,1,1,1,1,1,1
+    2,10,0,0,0,0,0,0
+    2,0,10,0,0,0,0,0
+    2,0,0,10,0,0,0,0
+    2,0,0,0,10,0,0,0
+    2,0,0,0,0,10,0,0
+    2,0,0,0,0,0,10,0
+    2,0,0,0,0,0,0,10
+    */
+
+    /*
+    Matrix B will have 2 rows per nodelet, total 2RowsX8Nodelets
+    
+    Same expected Migration and Cause as before. Just doubles for the new Matrix
+    */
+
     Matrix_t * B = Matrix_t::create(nrows);
+    
+    /*
+    Resulting Memory Map at this stage
+    7246,2,2,2,2,2,2,2
+    4,20,0,0,0,0,0,0
+    4,0,20,0,0,0,0,0
+    4,0,0,20,0,0,0,0
+    4,0,0,0,20,0,0,0
+    4,0,0,0,0,20,0,0
+    4,0,0,0,0,0,20,0
+    4,0,0,0,0,0,0,20
+    */
 
     Index_t row_idx_1 = 2; // Build at 1st row in 2nd nodelet
     /*
     Expected Migration:
 	The last spawned thread from allocRows migrates to nodelet 2 
-        and spawns a build function at nodelet 2
-    Cause: 
+        and spawns a build function at nodelet 2.
+        Hence there is one additional migration from 0..2 and two
+        additional migrations from 2..0
+    Cause:
 	because of the cilk_migrate_hint at nodelet 2
-    Resulting Memory Map:
-	MEMORY MAP without B matrix
-	6712,1,2,1,1,1,1,1
-	2,10,0,0,0,0,0,0
-	4,0,1371,0,0,0,0,0
-	2,0,0,10,0,0,0,0
-	2,0,0,0,10,0,0,0
-	2,0,0,0,0,10,0,0
-	2,0,0,0,0,0,10,0
-	2,0,0,0,0,0,0,10
     */
     cilk_migrate_hint(A->nodelet_addr(row_idx_1));
     cilk_spawn A->build(row_idx_1);
-    
+    /*
+    Resulting Memory Map at this stage:
+    7282,2,3,2,2,2,2,2
+    4,20,0,0,0,0,0,0
+    6,0,1381,0,0,0,0,0
+    4,0,0,20,0,0,0,0
+    4,0,0,0,20,0,0,0
+    4,0,0,0,0,20,0,0
+    4,0,0,0,0,0,20,0
+    4,0,0,0,0,0,0,20
+   */
+
     Index_t row_idx_2 = 13; // Build at 2nd row in 5th nodelet
     /*
     Expected Migration:
 	The last spawned thread from allocRows migrates to nodelet 5 
         and spawns a build function at nodelet 5
+        Hence there is one additional migration from 0..5 and two
+        additional migrations from 5..0
     Cause:
 	because of the cilk_migrate_hint at nodelet 5
-    Resulting Memory Map:
-	MEMORY MAP full program
-	7323,2,3,2,2,3,2,2
-	4,20,0,0,0,0,0,0
-	6,0,1381,0,0,0,0,0
-	4,0,0,20,0,0,0,0
-	4,0,0,0,20,0,0,0
-	6,0,0,0,0,1338,0,0
-	4,0,0,0,0,0,20,0
-	4,0,0,0,0,0,0,20
-   */
+    */
     cilk_migrate_hint(B->nodelet_addr(row_idx_2));
     cilk_spawn B->build(row_idx_2);
-
     cilk_sync;
-    
+
+    /*
+    Resulting Memory Map at end of the program:
+    7323,2,3,2,2,3,2,2
+    4,20,0,0,0,0,0,0
+    6,0,1381,0,0,0,0,0
+    4,0,0,20,0,0,0,0
+    4,0,0,0,20,0,0,0
+    6,0,0,0,0,1338,0,0
+    4,0,0,0,0,0,20,0
+    4,0,0,0,0,0,0,20
+   */
+
     hooks_region_end();
 
     return 0;
